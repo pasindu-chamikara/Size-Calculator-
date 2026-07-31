@@ -46,12 +46,25 @@ export default function SizeCalculator() {
   useEffect(() => {
     async function getDevices() {
       try {
-        // Request permission first to get labels
-        await navigator.mediaDevices.getUserMedia({ video: true });
+        // Request permission first to get labels. Try 'environment' (back camera) first for mobile.
+        try {
+          await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        } catch (e) {
+          // Fallback to any camera if environment camera is not available (e.g., desktop)
+          await navigator.mediaDevices.getUserMedia({ video: true });
+        }
+        
         const allDevices = await navigator.mediaDevices.enumerateDevices();
         const videoDevices = allDevices.filter(device => device.kind === 'videoinput');
+        
+        // On mobile, try to automatically select the back camera if we can identify it by label
+        const backCamera = videoDevices.find(d => d.label.toLowerCase().includes('back') || d.label.toLowerCase().includes('environment'));
+        
         setDevices(videoDevices);
-        if (videoDevices.length > 0) {
+        
+        if (backCamera) {
+          setSelectedDeviceId(backCamera.deviceId);
+        } else if (videoDevices.length > 0) {
           setSelectedDeviceId(videoDevices[0].deviceId);
         }
       } catch (e) {
