@@ -26,6 +26,10 @@ export default function SizeCalculator() {
   const [error, setError] = useState<string | null>(null);
   const [scriptsLoaded, setScriptsLoaded] = useState(false);
   
+  // Camera selection state
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+
   // Scanning state
   const [scanProgress, setScanProgress] = useState(0);
   const [isLocked, setIsLocked] = useState(false);
@@ -37,6 +41,25 @@ export default function SizeCalculator() {
   useEffect(() => {
     isLockedRef.current = isLocked;
   }, [isLocked]);
+
+  // Fetch available cameras
+  useEffect(() => {
+    async function getDevices() {
+      try {
+        // Request permission first to get labels
+        await navigator.mediaDevices.getUserMedia({ video: true });
+        const allDevices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = allDevices.filter(device => device.kind === 'videoinput');
+        setDevices(videoDevices);
+        if (videoDevices.length > 0) {
+          setSelectedDeviceId(videoDevices[0].deviceId);
+        }
+      } catch (e) {
+        console.error("Error fetching devices:", e);
+      }
+    }
+    getDevices();
+  }, []);
 
   const onResults = useCallback((results: any) => {
     if (!canvasRef.current || !videoRef.current) return;
@@ -84,9 +107,6 @@ export default function SizeCalculator() {
     const rightHip = landmarks[24];
     const leftElbow = landmarks[13];
     const rightElbow = landmarks[14];
-    
-    // For height, we must use the top of the head to the bottom of the feet. 
-    // Nose to Ankle/Heel is a stable metric.
     const leftHeel = landmarks[29];
     const rightHeel = landmarks[30];
     
@@ -96,7 +116,7 @@ export default function SizeCalculator() {
     // Enforce full body visibility for accurate scaling
     if (leftHeel.visibility < 0.4 && rightHeel.visibility < 0.4) {
       setError("Please step back so your full body (head to feet) is in the frame.");
-      setScanProgress(0); // Reset scan if they move out of frame
+      setScanProgress(0);
       framesCollected.current = 0;
       accumulatedMeasurements.current = { shoulder: 0, length: 0, sleeve: 0 };
       return;
@@ -104,16 +124,27 @@ export default function SizeCalculator() {
       setError(null);
     }
 
-    const shoulderPxWidth = Math.abs(leftShoulder.x - rightShoulder.x) * canvasWidth;
-    const midShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
-    const midHipY = (leftHip.y + rightHip.y) / 2;
-    const torsoPxLength = Math.abs(midHipY - midShoulderY) * canvasHeight * 1.15;
-    const sleevePxLength = (Math.abs(leftShoulder.y - leftElbow.y) + Math.abs(rightShoulder.y - rightElbow.y)) / 2 * canvasHeight * 0.8;
+    // Helper for precise 2D Euclidean Distance
+    const getDistance = (lm1: any, lm2: any) => {
+      const dx = (lm1.x - lm2.x) * canvasWidth;
+      const dy = (lm1.y - lm2.y) * canvasHeight;
+      return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    // Calculate actual distances even if leaning
+    const shoulderPxWidth = getDistance(leftShoulder, rightShoulder);
     
-    // Calculate stable vertical height (Nose to lowest Heel)
-    // Add a ~5% buffer because nose is not the very top of the head
-    const lowestHeelY = Math.max(leftHeel.y, rightHeel.y);
-    const heightPx = Math.abs(lowestHeelY - nose.y) * canvasHeight * 1.05;
+    const midShoulder = { x: (leftShoulder.x + rightShoulder.x)/2, y: (leftShoulder.y + rightShoulder.y)/2 };
+    const midHip = { x: (leftHip.x + rightHip.x)/2, y: (leftHip.y + rightHip.y)/2 };
+    const torsoPxLength = getDistance(midShoulder, midHip) * 1.15;
+    
+    const leftSleevePx = getDistance(leftShoulder, leftElbow);
+    const rightSleevePx = getDistance(rightShoulder, rightElbow);
+    const sleevePxLength = ((leftSleevePx + rightSleevePx) / 2) * 0.8;
+    
+    // Height from Nose to lowest Heel (accounting for tilt)
+    const lowestHeel = leftHeel.y > rightHeel.y ? leftHeel : rightHeel;
+    const heightPx = getDistance(nose, lowestHeel) * 1.05; // ~5% addition to account for top of head
 
     if (heightPx === 0) return;
 
@@ -124,14 +155,13 @@ export default function SizeCalculator() {
     const lengthInches = (leftHip.visibility > 0.5) ? torsoPxLength / pixelsPerInch : 0;
     const sleeveInches = (leftElbow.visibility > 0.5) ? sleevePxLength / pixelsPerInch : 0;
 
-    // Only update if reasonable
+    // Reject wild anomalies
     if (shoulderInches > 5 && shoulderInches < 30) {
       framesCollected.current += 1;
       accumulatedMeasurements.current.shoulder += shoulderInches;
       accumulatedMeasurements.current.length += lengthInches;
       accumulatedMeasurements.current.sleeve += sleeveInches;
 
-      // Increase sample size to 60 frames (approx 2 seconds) for even smoother averaging
       const progress = Math.min(Math.floor((framesCollected.current / 60) * 100), 100);
       setScanProgress(progress);
 
@@ -151,7 +181,6 @@ export default function SizeCalculator() {
         
         setRecommendedSize(determineSize(avgShoulder, avgChest, avgLength));
       } else {
-        // Show live preview while scanning
         setMeasurements({
           shoulder: Math.round(shoulderInches * 10) / 10,
           chest: Math.round(chestInches * 10) / 10,
@@ -172,15 +201,25 @@ export default function SizeCalculator() {
   };
 
   useEffect(() => {
-    if (!scriptsLoaded) return;
+    if (!scriptsLoaded || !selectedDeviceId) return;
     
-    let camera: any = null;
+    let activeStream: MediaStream | null = null;
+    let animationFrameId: number;
+    let isActive = true;
 
     const startCamera = async () => {
       try {
-        await navigator.mediaDevices.getUserMedia({ video: true });
+        activeStream = await navigator.mediaDevices.getUserMedia({ 
+          video: { deviceId: { exact: selectedDeviceId } } 
+        });
+        
         setHasPermission(true);
         setError(null);
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = activeStream;
+          await videoRef.current.play();
+        }
         
         const pose = new window.Pose({
           locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
@@ -196,20 +235,18 @@ export default function SizeCalculator() {
         });
 
         pose.onResults(onResults);
+        setIsTracking(true);
 
-        if (videoRef.current) {
-          camera = new window.Camera(videoRef.current, {
-            onFrame: async () => {
-              if (videoRef.current) {
-                await pose.send({ image: videoRef.current });
-              }
-            },
-            width: 640,
-            height: 480
-          });
-          camera.start();
-          setIsTracking(true);
-        }
+        const processVideo = async () => {
+          if (!isActive) return;
+          if (videoRef.current && videoRef.current.readyState >= 2) {
+            await pose.send({ image: videoRef.current });
+          }
+          animationFrameId = requestAnimationFrame(processVideo);
+        };
+        
+        processVideo();
+
       } catch (err: any) {
         setHasPermission(false);
         setError("Camera permission denied or camera not found.");
@@ -220,11 +257,14 @@ export default function SizeCalculator() {
     startCamera();
 
     return () => {
-      if (camera) {
-        camera.stop();
+      isActive = false;
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+      if (activeStream) {
+        activeStream.getTracks().forEach(track => track.stop());
       }
+      setIsTracking(false);
     };
-  }, [onResults, scriptsLoaded]);
+  }, [onResults, scriptsLoaded, selectedDeviceId]);
 
   return (
     <>
@@ -256,19 +296,38 @@ export default function SizeCalculator() {
         </div>
         
         <div className="flex flex-col sm:flex-row gap-4 w-full bg-gray-50 p-4 rounded-lg border">
-          <div className="flex-1">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Your Height (inches)</label>
-            <input 
-              type="number" 
-              value={heightInches}
-              onChange={(e) => {
-                setHeightInches(Number(e.target.value) || 0);
-                if (isLocked) handleRestart();
-              }}
-              className="w-full px-3 py-2 border rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
-              placeholder="e.g. 68 for 5'8&quot;"
-            />
-            <p className="text-xs text-gray-500 mt-1">Enter your exact height to calibrate the measurement scale.</p>
+          <div className="flex-1 flex flex-col justify-center space-y-4">
+            {devices.length > 0 && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Select Camera</label>
+                <select 
+                  value={selectedDeviceId}
+                  onChange={(e) => setSelectedDeviceId(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 bg-white"
+                >
+                  {devices.map((device, idx) => (
+                    <option key={device.deviceId} value={device.deviceId}>
+                      {device.label || `Camera ${idx + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Your Height (inches)</label>
+              <input 
+                type="number" 
+                value={heightInches}
+                onChange={(e) => {
+                  setHeightInches(Number(e.target.value) || 0);
+                  if (isLocked) handleRestart();
+                }}
+                className="w-full px-3 py-2 border rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
+                placeholder="e.g. 68 for 5'8&quot;"
+              />
+              <p className="text-xs text-gray-500 mt-1">Enter your exact height to calibrate the measurement scale.</p>
+            </div>
           </div>
           
           <div className={`flex-1 p-4 rounded-md flex flex-col justify-center items-center border transition-colors ${isLocked ? 'bg-green-100 border-green-300' : 'bg-blue-50 border-blue-100'}`}>
